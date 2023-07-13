@@ -92,7 +92,7 @@ def megatron_gpt_generate(model, inputs, tokenizer, length_params, sampling_para
         sampling_params['all_probs'] = True
         sampling_params["add_BOS"] = False
         sampling_params['greedy'] = True
-        response = generate(
+        response_generator = generate(
             model,
             inputs=inputs,
             tokens_to_generate=length_params['max_length'],
@@ -105,11 +105,14 @@ def megatron_gpt_generate(model, inputs, tokenizer, length_params, sampling_para
             greedy=sampling_params['use_greedy'],
             repetition_penalty=sampling_params['repetition_penalty'],
             min_tokens_to_generate=length_params['min_length'],
+            stream_interval=sampling_params.get("stream_interval", 0),
             compute_attention_mask=sampling_params.get("compute_attention_mask", True),
             **strategy_args,
         )
+        for response in response_generator:
+            pass
         compute_prob_response = get_computeprob_response(tokenizer, response, inputs)
-        return compute_prob_response
+        yield compute_prob_response
 
     if isinstance(inputs, (list, tuple)):
         if isinstance(inputs[0], (str, torch.Tensor)):
@@ -126,9 +129,10 @@ def megatron_gpt_generate(model, inputs, tokenizer, length_params, sampling_para
                 greedy=sampling_params['use_greedy'],
                 repetition_penalty=sampling_params['repetition_penalty'],
                 min_tokens_to_generate=length_params['min_length'],
+                stream_interval=sampling_params.get("stream_interval", 0),
                 **strategy_args,
             )
-            return output
+            yield from output
         elif isinstance(inputs[0], dict):
             raise NotImplementedError("json object not implemented")
         else:
@@ -280,6 +284,7 @@ def send_generate_info(
     repetition_penalty,
     min_tokens_to_generate,
     end_strings,
+    stream_interval,
 ):
     """
     Needs to be synced up with receive_generate_info
@@ -299,6 +304,7 @@ def send_generate_info(
         greedy,
         repetition_penalty,
         min_tokens_to_generate,
+        stream_interval,
     ]
     input_info_tensor = torch.cuda.FloatTensor(input_info)
     torch.distributed.broadcast(input_info_tensor, src, model_parallel_group)
@@ -322,7 +328,7 @@ def receive_generate_info():
     """
     model_parallel_group = parallel_state.get_model_parallel_group()
     src = get_model_parallel_src_rank()
-    input_info_tensor = torch.empty(11, dtype=torch.float32, device=torch.cuda.current_device())
+    input_info_tensor = torch.empty(12, dtype=torch.float32, device=torch.cuda.current_device())
     torch.distributed.broadcast(input_info_tensor, src, model_parallel_group)
     batch_size = int(input_info_tensor[0].item())
     seq_len = int(input_info_tensor[1].item())
@@ -335,6 +341,7 @@ def receive_generate_info():
     greedy = bool(input_info_tensor[8].item())
     repetition_penalty = float(input_info_tensor[9].item())
     min_tokens_to_generate = int(input_info_tensor[10].item())
+    stream_interval = int(input_info_tensor[11].item())
 
     context_length_tensor = torch.empty(batch_size, dtype=torch.int64, device=torch.cuda.current_device())
     context_tokens_tensor = torch.empty(batch_size, seq_len, dtype=torch.int64, device=torch.cuda.current_device())
@@ -363,6 +370,7 @@ def receive_generate_info():
         repetition_penalty,
         min_tokens_to_generate,
         end_strings,
+        stream_interval,
     )
 
 
@@ -382,6 +390,7 @@ def synced_generate(
     repetition_penalty=1.2,
     min_tokens_to_generate=0,
     end_strings=[],
+    stream_interval=0,
 ):
     context_length = context_length_tensor.min().item()
     tokenizer = model.tokenizer
@@ -416,8 +425,21 @@ def synced_generate(
             },
         )
 
-    for tokens, lengths, output_logits, full_logits in batch_token_iterator:
-        context_length += 1
+    # Force eager execution if computing probs
+    # or if streaming is not enabled
+    if compute_logprob or all_probs or stream_interval == 0:
+        for tokens, lengths, output_logits, full_logits in batch_token_iterator:
+            context_length += 1
+    # If streaming is enabled, wait for a batch of size stream_interval
+    else:
+        for tokens, lengths, output_logits, full_logits in batch_token_iterator:
+            context_length += 1
+            if context_length % stream_interval == 0:
+                if tokens is not None:
+                    yield tokens[:, :context_length], output_logits, full_logits
+        if tokens is not None:
+            yield tokens[:, :context_length], output_logits, full_logits
+        return
 
     if parallel_state.is_pipeline_last_stage():
         src = parallel_state.get_pipeline_model_parallel_last_rank()
@@ -458,8 +480,10 @@ def synced_generate(
                     device=torch.device("cuda"),
                 )
                 torch.distributed.broadcast(full_logits, src, group)
-    if tokens is not None:
-        return tokens[:, :context_length], output_logits, full_logits
+
+    if compute_logprob or all_probs or stream_interval == 0:
+        if tokens is not None:
+            yield tokens[:, :context_length], output_logits, full_logits
 
 
 def generate(
@@ -477,6 +501,7 @@ def generate(
     repetition_penalty=1.0,
     min_tokens_to_generate=0,
     end_strings=['<|endoftext|>'],
+    stream_interval=0,
     **strategy_args,
 ) -> OutputType:
     """
@@ -529,6 +554,7 @@ def generate(
             repetition_penalty,
             min_tokens_to_generate,
             end_strings,
+            stream_interval,
         )
     else:
         (
@@ -544,6 +570,7 @@ def generate(
             repetition_penalty,
             min_tokens_to_generate,
             end_strings,
+            stream_interval,
         ) = receive_generate_info()
 
     output = synced_generate(
@@ -562,6 +589,7 @@ def generate(
         repetition_penalty=repetition_penalty,
         min_tokens_to_generate=min_tokens_to_generate,
         end_strings=end_strings,
+        stream_interval=stream_interval,
     )
     special_tokens = set()
     if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is not None:
@@ -579,53 +607,69 @@ def generate(
     if hasattr(tokenizer, 'mask_token') and tokenizer.mask_token is not None:
         special_tokens.add(tokenizer.mask_token)
     if output is not None:
-        decode_tokens, output_logits, full_logits = output
+        old_cnt = 0
+        token_cnt = 0
         resp_sentences = []
         resp_sentences_seg = []
-
-        decode_tokens = decode_tokens.cpu().numpy().tolist()
-        for decode_token in decode_tokens:
-            sentence = tokenizer.ids_to_text(decode_token)
-            resp_sentences.append(sentence)
-            if not isinstance(tokenizer, TabularTokenizer):
-                words = []
-                for token in decode_token:
-                    if not isinstance(token, Iterable):
-                        token = [token]
-                    word = tokenizer.ids_to_tokens(token)
-                    if isinstance(word, Iterable):
-                        word = word[0]
-                    if hasattr(tokenizer.tokenizer, 'byte_decoder'):
-                        word = bytearray([tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
-                            'utf-8', errors='replace'
-                        )
-                    words.append(word)
-                resp_sentences_seg.append(words)
-            else:
-                words = tokenizer.text_to_tokens(sentence)
-                resp_sentences_seg.append(words)
-
-        # offsets calculation
         all_offsets = []
-        for item in resp_sentences_seg:
-            offsets = [0]
-            for index, token in enumerate(item):
-                if index != len(item) - 1:
-                    if token in special_tokens:
-                        offsets.append(offsets[-1])
-                    else:
-                        offsets.append(len(token) + offsets[-1])
-            all_offsets.append(offsets)
+        for decode_tokens, output_logits, full_logits in output:
+            decode_tokens = decode_tokens.cpu().numpy().tolist()
+            for idx, decode_token in enumerate(decode_tokens):
+                old_cnt = token_cnt
+                token_cnt = len(decode_token)
+                decode_token = decode_token[old_cnt:]
+                sentence = tokenizer.ids_to_text(decode_token)
+                if not isinstance(tokenizer, TabularTokenizer):
+                    words = []
+                    for token in decode_token:
+                        if not isinstance(token, Iterable):
+                            token = [token]
+                        word = tokenizer.ids_to_tokens(token)
+                        if isinstance(word, Iterable):
+                            word = word[0]
+                        if hasattr(tokenizer.tokenizer, 'byte_decoder'):
+                            word = bytearray([tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
+                                'utf-8', errors='replace'
+                            )
+                        words.append(word)
+                else:
+                    words = tokenizer.text_to_tokens(sentence)
+                if idx < len(resp_sentences_seg):
+                    resp_sentences_seg[idx] += words
+                else:
+                    resp_sentences_seg.append(words)
+                ### NOTE: This is a work-around for leading-space trimming
+                if old_cnt > 0 and len(words) > 0 and len(words[0]) > 0:
+                    if words[0].startswith('▁'):
+                        sentence = ' ' + sentence
+                if idx < len(resp_sentences):
+                    resp_sentences[idx] += sentence
+                else:
+                    resp_sentences.append(sentence)
 
-        output = {}
-        output['sentences'] = resp_sentences
-        output['tokens'] = resp_sentences_seg
-        output['logprob'] = output_logits
-        output['full_logprob'] = full_logits
-        output['token_ids'] = decode_tokens
-        output['offsets'] = all_offsets
-        output = inference_strategy.post_generation_process(output)
-        return output
+                # offsets calculation
+                for item in resp_sentences_seg:
+                    offsets = [0]
+                    for index, token in enumerate(item):
+                        if index != len(item) - 1:
+                            if token in special_tokens:
+                                offsets.append(offsets[-1])
+                            else:
+                                offsets.append(len(token) + offsets[-1])
+                    if idx < len(all_offsets):
+                        all_offsets[idx] += offsets
+                    else:
+                        all_offsets.append(offsets)
+
+            ret = {}
+            ret['sentences'] = resp_sentences
+            ret['tokens'] = resp_sentences_seg
+            ret['logprob'] = output_logits
+            ret['full_logprob'] = full_logits
+            ret['token_ids'] = decode_tokens
+            ret['offsets'] = all_offsets
+            ret = inference_strategy.post_generation_process(ret)
+            yield ret
 
 
 def switch(val1, val2, boolean):
