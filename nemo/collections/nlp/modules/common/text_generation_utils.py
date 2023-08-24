@@ -431,7 +431,7 @@ def synced_generate(
 
     # Force eager execution if computing probs
     # or if streaming is not enabled
-    if compute_logprob or all_probs or stream_interval == 0:
+    if compute_logprob or stream_interval == 0:
         for tokens, lengths, output_logits, full_logits in batch_token_iterator:
             context_length += 1
     # If streaming is enabled, wait for a batch of size stream_interval
