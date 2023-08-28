@@ -115,6 +115,7 @@ def megatron_gpt_generate(model, inputs, tokenizer, length_params, sampling_para
             pass
         compute_prob_response = get_computeprob_response(tokenizer, response, inputs)
         yield compute_prob_response
+        return
 
     if isinstance(inputs, (list, tuple)):
         if isinstance(inputs[0], (str, torch.Tensor)):
@@ -123,7 +124,7 @@ def megatron_gpt_generate(model, inputs, tokenizer, length_params, sampling_para
                 inputs=inputs,
                 tokens_to_generate=length_params['max_length'],
                 all_probs=sampling_params['all_probs'],
-                compute_logprob=sampling_params['compute_logprob'],
+                compute_logprob=sampling_params['all_probs'],
                 temperature=sampling_params['temperature'],
                 add_BOS=sampling_params['add_BOS'],
                 top_k=sampling_params['top_k'],
