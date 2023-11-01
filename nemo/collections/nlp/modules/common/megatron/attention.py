@@ -66,18 +66,36 @@ except (ImportError, ModuleNotFoundError):
     HAVE_MEGATRON_CORE = False
 
 try:
+    # Flash Attention 1.X
     from flash_attn.bert_padding import pad_input, unpad_input
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
-    from flash_attn.flash_attn_triton import flash_attn_func
+    from flash_attn.flash_attn_triton import flash_attn_func as flash_attn_func_triton
 
     HAVE_FLASH_ATTENTION = True
+    flash_attn_func = None
 
 except (ImportError, ModuleNotFoundError):
+    try:
+        # Flash Attention 2.X
+        from flash_attn import flash_attn_func
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
 
-    HAVE_FLASH_ATTENTION = False
+        HAVE_FLASH_ATTENTION = True
 
-    flash_attn_unpadded_func, flash_attn_func = None, None
-    unpad_input, pad_input = None, None
+    except (ImportError, ModuleNotFoundError):
+
+        HAVE_FLASH_ATTENTION = False
+
+        flash_attn_unpadded_func, flash_attn_func_triton, flash_attn_func = None, None, None
+        unpad_input, pad_input = None, None
+
+    try:
+        # Flash Attention 2.2
+        from flash_attn import flash_attn_with_kvcache
+
+    except (ImportError, ModuleNotFoundError):
+
+        flash_attn_with_kvcache = None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -134,9 +152,10 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         self.normalize_attention_scores = normalize_attention_scores
         self.position_embedding_type = position_embedding_type
         self.multi_query_attention = multi_query_attention
+        self.use_flash_attention = use_flash_attention
 
         self.megatron_legacy = megatron_legacy
-        self.dtype = utils_funcs.dtype_from_precision(precision, megatron_amp_O2)
+        self.dtype = utils_funcs.torch_dtype_from_precision(precision, megatron_amp_O2)
 
         self.set_accepted_adapter_types(
             [
@@ -245,7 +264,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         """Forward method with activation checkpointing."""
 
         def custom_forward(*inputs):
-            if len(inputs) == 8:
+            if len(inputs) == 7:
                 query_layer = inputs[0]
                 key_layer = inputs[1]
                 value_layer = inputs[2]
@@ -253,8 +272,7 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 rotary_pos_emb = inputs[4]
                 relative_position_bias = inputs[5]
                 headscale_tensor = inputs[6]
-                inference_mode = inputs[7]
-            elif len(inputs) == 9:
+            elif len(inputs) == 8:
                 query_layer = inputs[0]
                 key_layer = inputs[1]
                 value_layer = inputs[2]
@@ -262,7 +280,6 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
                 rotary_pos_emb = (inputs[4], inputs[5])
                 relative_position_bias = inputs[6]
                 headscale_tensor = inputs[7]
-                inference_mode = inputs[8]
             else:
                 raise ValueError('unexpected number of inputs')
             output_ = self.core_attention(
@@ -495,7 +512,23 @@ class ParallelAttention(MegatronModule, adapter_mixins.AdapterModuleMixin):
         if get_key_value:
             present = (key_layer, value_layer)
 
-        if checkpoint_core_attention:
+        if (
+            flash_attn_with_kvcache is not None
+            and self.use_flash_attention
+            and rotary_pos_emb is not None
+            and inference_max_sequence_len
+            and not set_inference_key_value_memory
+        ):
+            # Mainly used for decoding with sq=1
+            q = rearrange(apply_rotary_pos_emb(query_layer, rotary_pos_emb[0]), 'sq b np hn -> b sq np hn')
+            k = rearrange(apply_rotary_pos_emb(key_layer, rotary_pos_emb[1]), 'sk b np hn -> b sk np hn')
+            v = rearrange(value_layer, 'sk b np hn -> b sk np hn')
+            context_layer = flash_attn_with_kvcache(
+                q=q, k_cache=k, v_cache=v, causal=self.attn_mask_type == AttnMaskType.causal,
+            )
+            context_layer = rearrange(context_layer, 'b sq np hn -> sq b (np hn)')
+
+        elif checkpoint_core_attention:
             context_layer = self._checkpointed_attention_forward(
                 query_layer,
                 key_layer,
@@ -968,24 +1001,37 @@ class CoreAttention(MegatronModule):
             attention_mask_q = ~attention_mask
             attention_mask_kv = ~attention_mask
 
-        q, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(query_layer, attention_mask_q)
-        k, _, cu_seqlens_k, max_seqlen_k = unpad_input(key_layer, attention_mask_kv)
-        v, _, _, _ = unpad_input(value_layer, attention_mask_kv)
+        seqlens_q_in_batch = len(attention_mask_q.sum(dim=-1, dtype=torch.int32).unique())
+        seqlens_kv_in_batch = len(attention_mask_kv.sum(dim=-1, dtype=torch.int32).unique())
 
-        context_layer = flash_attn_unpadded_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=self.attention_dropout_p if self.training else 0.0,
-            causal=is_causal,
-        )
+        if seqlens_q_in_batch == 1 and seqlens_kv_in_batch == 1 and flash_attn_func is not None:
+            # [b, sq, np, hn]
+            context_layer = flash_attn_func(
+                query_layer,
+                key_layer,
+                value_layer,
+                dropout_p=self.attention_dropout_p if self.training else 0.0,
+                causal=is_causal,
+            )
+        else:
+            q, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(query_layer, attention_mask_q)
+            k, _, cu_seqlens_k, max_seqlen_k = unpad_input(key_layer, attention_mask_kv)
+            v, _, _, _ = unpad_input(value_layer, attention_mask_kv)
 
-        # [b, sq, np, hn]
-        context_layer = pad_input(context_layer, indices_q, batch_size, seqlen)
+            context_layer = flash_attn_unpadded_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p=self.attention_dropout_p if self.training else 0.0,
+                causal=is_causal,
+            )
+
+            # [b, sq, np, hn]
+            context_layer = pad_input(context_layer, indices_q, batch_size, seqlen)
 
         # [b, sq, np, hn] -> [b, np, sq, hn]
         context_layer = context_layer.permute(0, 2, 1, 3)
@@ -1011,7 +1057,7 @@ class CoreAttention(MegatronModule):
             if attention_bias.shape[3] == attention_mask_kv.shape[3]:
                 attention_bias = attention_bias.masked_fill(~attention_mask_kv, torch.finfo(query_layer.dtype).min)
 
-        context_layer = flash_attn_func(query_layer, key_layer, value_layer, attention_bias, is_causal,)
+        context_layer = flash_attn_func_triton(query_layer, key_layer, value_layer, attention_bias, is_causal,)
 
         # [b, sq, np, hn] -> [b, np, sq, hn]
         context_layer = context_layer.permute(0, 2, 1, 3)

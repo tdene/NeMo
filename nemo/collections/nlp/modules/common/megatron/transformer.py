@@ -187,7 +187,7 @@ class ParallelTransformerLayer_(MegatronModule, adapter_mixins.AdapterModuleMixi
         self.bias = bias
         self.transformer_block_type = transformer_block_type
         self.position_embedding_type = position_embedding_type
-        self.param_dtype = utils_funcs.dtype_from_precision(precision, megatron_amp_O2)
+        self.param_dtype = utils_funcs.torch_dtype_from_precision(precision, megatron_amp_O2)
 
         self.set_accepted_adapter_types(
             [
@@ -729,7 +729,7 @@ class ParallelTransformerLayer(ParallelTransformerLayer_):
         )
 
         # Dtype for forward pass - ignore amp O2
-        self.dtype = utils_funcs.dtype_from_precision(precision, megatron_amp_O2=None)
+        self.dtype = utils_funcs.torch_dtype_from_precision(precision, megatron_amp_O2=None)
 
     def forward(
         self,
@@ -845,7 +845,7 @@ class AutocastTransformerLayer(TransformerLayer):
         # use_emha=use_emha,
 
         # Dtype for forward pass - ignore amp O2
-        self.dtype = utils_funcs.dtype_from_precision(autocast_dtype, megatron_amp_O2=None)
+        self.dtype = utils_funcs.torch_dtype_from_precision(autocast_dtype, megatron_amp_O2=None)
 
     def forward(
         self,
@@ -981,14 +981,14 @@ class ParallelTransformer(MegatronModule):
                 elif self.activations_checkpoint_method == 'block':
                     logging.info(
                         (
-                            f'Using block activation checkpointing requires activations_checkpoint_num_layers to be set.'
-                            f'Got: {self.activations_checkpoint_num_layers}. Setting to 1 by default.'
+                            f'Using block activation checkpointing with granularity selective forces all layers to use checkpointing.'
                         )
                     )
                 else:
                     raise ValueError(
                         f'activations_checkpoint_method should be "uniform" or "block" when using granularity selective.'
                     )
+                self.activations_checkpoint_num_layers = num_layers  # forcing all layers
             elif self.activations_checkpoint_granularity == 'full':
                 if self.activations_checkpoint_method in ['uniform', 'block']:
                     if not self.activations_checkpoint_num_layers:
@@ -998,6 +998,7 @@ class ParallelTransformer(MegatronModule):
                                 f'Got: {self.activations_checkpoint_num_layers}. Setting to 1 by default.'
                             )
                         )
+                        self.activations_checkpoint_num_layers = 1  # keeping the old default
                 else:
                     raise ValueError(
                         f'activations_checkpoint_method should be "uniform" or "block" when using granularity full.'
@@ -1032,7 +1033,10 @@ class ParallelTransformer(MegatronModule):
                 reduce_amax=reduce_amax,
             )
 
-        self.is_first_microbatch = True
+        self.is_first_train_microbatch = (
+            True  # Is the current micro-batch the first micro-batch in a global-batch in training
+        )
+        self.is_prev_microbatch_training = True  # Is the previous micro-batch in training mode
         self.microbatch_count = 0  # transformer engine forward needs to know if it is working on the first microbatch
         self.checkpoint_core_attention = (
             activations_checkpoint_granularity == 'selective'
@@ -1047,6 +1051,13 @@ class ParallelTransformer(MegatronModule):
         # TODO: Add similar assert for encoder-decoder.
 
         self.num_layers = self.get_num_layers(num_layers)
+
+        if (
+            self.activations_checkpoint_num_layers is not None
+            and self.activations_checkpoint_num_layers > self.num_layers
+        ):
+            self.activations_checkpoint_num_layers = self.num_layers
+
         # Transformer layers.
         def build_layer(layer_number):
             if isinstance(layer_type, list):
@@ -1236,6 +1247,12 @@ class ParallelTransformer(MegatronModule):
                     attention_mask = inputs[1]
                     encoder_output = inputs[2]
                     enc_dec_attn_mask = inputs[3]
+                    # Cache FP8 weight and transpose at (1) the first micro-batch in each global-batch
+                    # in training, (2) the first micro-batch in each validation and test routine.
+                    # The caching happens in TransformerEngine when passing `is_first_microbatch=True`.
+                    is_first_microbatch = (self.is_first_train_microbatch and self.training) or (
+                        self.is_prev_microbatch_training and not self.training
+                    )
                     for index in range(start, end):
                         layer = self._get_layer(index)
                         hidden_states = layer(
@@ -1244,7 +1261,7 @@ class ParallelTransformer(MegatronModule):
                             encoder_output=encoder_output,
                             enc_dec_attn_mask=enc_dec_attn_mask,
                             inference_params=None,
-                            is_first_microbatch=self.is_first_microbatch,
+                            is_first_microbatch=is_first_microbatch,
                             checkpoint_core_attention=False,
                         )
 
@@ -1520,6 +1537,12 @@ class ParallelTransformer(MegatronModule):
                         else:
                             checkpoint_core_attention = False
 
+                        # Cache FP8 weight and transpose at (1) the first micro-batch in each global-batch
+                        # in training, (2) the first micro-batch in each validation and test routine.
+                        # The caching happens in TransformerEngine when passing `is_first_microbatch=True`.
+                        is_first_microbatch = (self.is_first_train_microbatch and self.training) or (
+                            self.is_prev_microbatch_training and not self.training
+                        )
                         if self.transformer_engine:
                             hidden_states = layer(
                                 hidden_states,
@@ -1527,7 +1550,7 @@ class ParallelTransformer(MegatronModule):
                                 encoder_output=encoder_output,
                                 enc_dec_attn_mask=enc_dec_attn_mask,
                                 inference_params=self.inference_params,
-                                is_first_microbatch=self.is_first_microbatch,
+                                is_first_microbatch=is_first_microbatch,
                                 checkpoint_core_attention=checkpoint_core_attention,
                             )
                         else:
@@ -1554,9 +1577,10 @@ class ParallelTransformer(MegatronModule):
             self.microbatch_count += 1
             if self.microbatch_count % num_micro_batches == 0:
                 self.microbatch_count = 0
-                self.is_first_microbatch = True
+                self.is_first_train_microbatch = True
             else:
-                self.is_first_microbatch = False
+                self.is_first_train_microbatch = False
+        self.is_prev_microbatch_training = self.training
 
         output = hidden_states
 

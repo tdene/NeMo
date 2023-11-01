@@ -167,6 +167,7 @@ class GPTModel(MegatronModule):
         ub_tp_comm_overlap=False,
         use_flash_attention=False,
         seq_len_interpolation_factor=None,
+        rotary_base=10000,
     ):
         super(GPTModel, self).__init__(config=config, share_token_embeddings=share_embeddings_and_output_weights)
 
@@ -176,7 +177,7 @@ class GPTModel(MegatronModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.sequence_parallel = self.config.sequence_parallel
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
-        self.dtype = utils_funcs.dtype_from_precision(precision, megatron_amp_O2)
+        self.dtype = utils_funcs.torch_dtype_from_precision(precision, megatron_amp_O2)
 
         if kv_channels is None:
             assert (
@@ -248,6 +249,7 @@ class GPTModel(MegatronModule):
             ub_tp_comm_overlap=ub_tp_comm_overlap,
             use_flash_attention=use_flash_attention,
             seq_len_interpolation_factor=seq_len_interpolation_factor,
+            rotary_base=rotary_base,
         )
 
         if self.share_embeddings_and_output_weights:
