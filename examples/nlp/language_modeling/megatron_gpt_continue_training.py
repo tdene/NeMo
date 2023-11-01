@@ -61,6 +61,9 @@ def _modify_config(gpt_cfg, cfg, add_cfg_to_tree=False):
         gpt_cfg.max_position_embeddings = cfg.model.max_position_embeddings
         gpt_cfg.seq_len_interpolation_factor = cfg.model.seq_len_interpolation_factor
         gpt_cfg.use_flash_attention = cfg.model.use_flash_attention
+        gpt_cfg.tensor_model_parallel_size = cfg.model.get('tensor_model_parallel_size', 1)
+        gpt_cfg.pipeline_model_parallel_size = cfg.model.get('pipeline_model_parallel_size', 1)
+        gpt_cfg.pipeline_model_parallel_split_rank = cfg.model.get('pipeline_model_parallel_split_rank', 0)
 
         # This is needed when modifying a hparam file directly to load `.ckpt` files.
         # This is not needed to modify the cfg in `.nemo` files.
@@ -180,7 +183,7 @@ def main(cfg) -> None:
         model = load_from_nemo(MegatronGPTModel, cfg, trainer, gpt_cfg, modify_confg_fn=_modify_config)
     elif cfg.model.get("pretrained_checkpoint", None) is not None:
         validate_checkpoint_loading_args(cfg.model.pretrained_checkpoint)
-        model = load_from_checkpoint_dir(MegatronGPTModel, cfg, trainer, gpt_cfg, modify_confg_fn=_modify_config)
+        model = load_from_checkpoint_dir(MegatronGPTModel, cfg, trainer, modify_confg_fn=_modify_config)
     else:
         print(' > WARNING: No checkpoint provided. Starting from scratch.')
         model = MegatronGPTModel(cfg.model, trainer)
