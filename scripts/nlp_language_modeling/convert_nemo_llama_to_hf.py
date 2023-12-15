@@ -18,7 +18,13 @@ from collections import OrderedDict
 
 import torch
 from pytorch_lightning import Trainer
-from transformers import AutoModelForCausalLM
+from transformers import (
+    AutoModelForCausalLM,
+    LlamaTokenizer,
+    LlamaTokenizerFast,
+    convert_slow_tokenizer,
+)
+from omegaconf import open_dict
 
 from nemo.collections.nlp.models.language_modeling.megatron_gpt_model import MegatronGPTModel
 from nemo.collections.nlp.parts.nlp_overrides import NLPDDPStrategy
@@ -39,18 +45,63 @@ This script can be used to 1) generate only the HF weights, or 2) generate an en
     python convert_nemo_llama_to_hf.py \
     --in-file /path/to/file.nemo or /path/to/extracted_folder \
     --out-file /path/to/pytorch_model.bin \
-    --hf-in-file /path/to/input_hf_folder \
-    --hf-out-file /path/to/output_hf_folder
+    --hf-in-path /path/to/input_hf_folder \
+    --hf-out-path /path/to/output_hf_folder \
+    --in-tokenizer /path/to/tokenizer \
+    --hf-out-tokenizer /path/to/output_tokenizer \
 
     Use the --cpu-only flag if the model cannot fit in the GPU (e.g. Llama2 70b). 
     However this option makes the conversion script significantly slower.
 """
 
+#################
+### Utilities ###
+#################
+
+
+def force_cpu_model(cfg):
+    with open_dict(cfg):
+        # temporarily set to cpu
+        original_cpu_init = cfg.get('use_cpu_initialization', False)
+        if 'megatron_amp_O2' in cfg:
+            key = 'megatron_amp_O2'
+            original_amp_o2 = cfg.megatron_amp_O2
+        elif 'megatron_amp_02' in cfg:
+            key = 'megatron_amp_02'
+            original_amp_o2 = cfg.megatron_amp_02
+        else:
+            key, original_amp_o2 = None, None
+
+        # Set new values
+        cfg.use_cpu_initialization = True
+        if key is not None:
+            cfg[key] = False
+
+    # Setup restore dict
+    restore_dict = {'use_cpu_initialization': original_cpu_init}  # 'megatron_amp_O2': original_amp_o2
+    if key is not None:
+        restore_dict[key] = original_amp_o2
+
+    return cfg, restore_dict
+
+
+def restore_model_config(cfg, original_dict):
+    with open_dict(cfg):
+        for key, val in original_dict.items():
+            logging.info(f"Restoring model config key ({key}) from {cfg[key]} to original value of {val}")
+            cfg[key] = val
+    return cfg
+
+
+#################
+### Utilities ###
+#################
+
 
 def get_args():
     parser = ArgumentParser()
     parser.add_argument(
-        "--in-file", type=str, default=None, required=True, help="Path to .nemo file",
+        "--in-file", type=str, default=None, required=True, help="Path to .nemo file or extracted folder",
     )
     parser.add_argument("--out-file", type=str, default=None, required=True, help="Path to HF .bin file")
     parser.add_argument(
@@ -64,6 +115,18 @@ def get_args():
         type=str,
         default=None,
         help="Output HF model path, " "with the same format as above but user's own weights",
+    )
+    parser.add_argument(
+        "--in-tokenizer",
+        type=str,
+        default=None,
+        help="Path to tokenizer used for the input nemo model. (need to extract the .nemo file first)",
+    )
+    parser.add_argument(
+        "--hf-out-tokenizer",
+        type=str,
+        default=None,
+        help="Path to save the tokenizer used for the output HF model.",
     )
     parser.add_argument(
         "--precision",
@@ -90,16 +153,22 @@ def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False) -> 
     if cpu_only:
         map_location = torch.device('cpu')
         model_config = MegatronGPTModel.restore_from(input_nemo_file, trainer=dummy_trainer, return_config=True)
-        model_config.use_cpu_initialization = True
         model_config.tensor_model_parallel_size = 1
+        # Force model onto CPU
+        model_config, restore_dict = force_cpu_model(model_config)
     else:
         map_location, model_config = None, None
+        model_config, restore_dict = None, {}
 
     if cpu_only:
         logging.info("******** Loading model on CPU. This will take a significant amount of time.")
     model = MegatronGPTModel.restore_from(
         input_nemo_file, trainer=dummy_trainer, override_config_path=model_config, map_location=map_location
     )
+
+    # Restore model config
+    restore_model_config(model.cfg, restore_dict)
+
     if precision is None:
         precision = model.cfg.precision
     if precision in [32, "32"]:
@@ -111,6 +180,7 @@ def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False) -> 
     else:
         logging.warning(f"Precision string {precision} is not recognized, falling back to fp32")
         dtype = torch.float32  # fallback
+    logger.info(f"Using precision {dtype}")
 
     param_to_weights = lambda param: param.to(dtype)
     checkpoint = OrderedDict()
@@ -205,21 +275,66 @@ def convert(input_nemo_file, output_hf_file, precision=None, cpu_only=False) -> 
     torch.save(checkpoint, output_hf_file)
     logging.info(f"Weights saved to {output_hf_file}")
 
+    return dtype
 
-def replace_hf_weights(weights_file, input_hf_path, output_hf_path):
-    model = AutoModelForCausalLM.from_pretrained(input_hf_path, local_files_only=True)
+
+def replace_hf_weights_and_tokenizer(
+    weights_file,
+    dtype,
+    input_hf_path,
+    output_hf_path,
+    tokenizer_path,
+    output_hf_tokenizer,
+):
+    model = AutoModelForCausalLM.from_pretrained(
+        input_hf_path,
+        local_files_only=True,
+        torch_dtype=dtype,
+    )
     nemo_exported = torch.load(weights_file)
+
+    if tokenizer_path:
+        tokenizer = LlamaTokenizer.from_pretrained(
+            tokenizer_path,
+            local_files_only=True,
+            legacy=False,
+        )
+        tmp_tokenizer = convert_slow_tokenizer.convert_slow_tokenizer(tokenizer)
+        fast_tokenizer = LlamaTokenizerFast(tokenizer_object=tmp_tokenizer)
+        tokenizer_length = len(fast_tokenizer)
+        model.resize_token_embeddings(tokenizer_length)
 
     model.load_state_dict(nemo_exported)
     model.save_pretrained(output_hf_path)
     logging.info(f"Full HF model saved to {output_hf_path}")
 
+    if tokenizer_path:
+        fast_tokenizer.save_pretrained(output_hf_tokenizer)
+        tokenizer.save_pretrained(output_hf_tokenizer)
+        logging.info(f"Tokenizer saved to {output_hf_tokenizer}")
+
 
 if __name__ == '__main__':
     args = get_args()
-    convert(args.in_file, args.out_file, precision=args.precision, cpu_only=args.cpu_only)
+    if not args.hf_out_tokenizer and args.hf_out_path:
+        args.hf_out_tokenizer = args.hf_out_path
+
+    dtype = convert(
+        args.in_file,
+        args.out_file,
+        precision=args.precision,
+        cpu_only=args.cpu_only
+    )
+
     if args.hf_in_path and args.hf_out_path:
-        replace_hf_weights(args.out_file, args.hf_in_path, args.hf_out_path)
+        replace_hf_weights_and_tokenizer(
+            args.out_file,
+            dtype,
+            args.hf_in_path,
+            args.hf_out_path,
+            args.in_tokenizer,
+            args.hf_out_tokenizer,
+        )
     else:
         logging.info("`hf-in-path` and/or `hf-out-path` not provided, not generating full HF model.")
         logging.info(f".bin file is saved to {args.out_file}")
